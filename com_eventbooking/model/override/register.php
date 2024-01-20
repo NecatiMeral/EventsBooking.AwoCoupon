@@ -9,11 +9,16 @@
 // no direct access
 defined('_JEXEC') or die;
 
+use Joomla\CMS\Factory;
+use Joomla\CMS\Language\Text;
+use Joomla\CMS\Plugin\PluginHelper;
+use Joomla\CMS\Router\Route;
+use Joomla\CMS\User\UserHelper;
 use Joomla\Registry\Registry;
 
-class EventBookingModelOverrideRegister extends RADModel
+class EventBookingModelOverrideRegister extends EventbookingModelRegister
 {
-    /**
+	/**
 	 * Process individual registration
 	 *
 	 * @param $data
@@ -21,32 +26,31 @@ class EventBookingModelOverrideRegister extends RADModel
 	 * @return int
 	 * @throws Exception
 	 */
-	public function processIndividualRegistration($data)
+	public function processIndividualRegistration(&$data)
 	{
-		jimport('joomla.user.helper');
+		$app     = Factory::getApplication();
+		$db      = Factory::getDbo();
+		$query   = $db->getQuery(true);
+		$user    = Factory::getUser();
+		$config  = EventbookingHelper::getConfig();
+		$eventId = (int) $data['event_id'];
+		$event   = EventbookingHelperDatabase::getEvent($eventId);
 
-		$app    = JFactory::getApplication();
-		$db     = JFactory::getDbo();
-		$query  = $db->getQuery(true);
-		$user   = JFactory::getUser();
-		$config = EventbookingHelper::getConfig();
+		EventbookingHelper::overrideGlobalConfig($config, $event);
 
 		/* @var EventbookingTableRegistrant $row */
-		$row                    = JTable::getInstance('EventBooking', 'Registrant');
-		$data['transaction_id'] = strtoupper(JUserHelper::genRandomPassword());
+		$row                       = $this->getTable('Registrant');
+		$data['transaction_id']    = strtoupper(UserHelper::genRandomPassword());
+		$data['registration_code'] = EventbookingHelperRegistration::getRegistrationCode();
+		$data['created_by']        = $user->id;
 
 		if (!$user->id && $config->user_registration)
 		{
-			$userId          = EventbookingHelperRegistration::saveRegistration($data);
+			$userId          = EventbookingHelper::callOverridableHelperMethod('Registration', 'saveRegistration', [$data]);
 			$data['user_id'] = $userId;
 		}
 
-		$row->registration_code = EventbookingHelperRegistration::getRegistrationCode();
-		$row->ticket_qrcode     = EventbookingHelperRegistration::getTicketCode();
-
-		// Calculate the payment amount
-		$eventId = (int) $data['event_id'];
-		$event   = EventbookingHelperDatabase::getEvent($eventId);
+		$row->ticket_qrcode = EventbookingHelperRegistration::getTicketCode();
 
 		if (($event->event_capacity > 0) && ($event->event_capacity <= $event->total_registrants))
 		{
@@ -59,18 +63,33 @@ class EventBookingModelOverrideRegister extends RADModel
 			$typeOfRegistration = 1;
 		}
 
-		$paymentMethod = isset($data['payment_method']) ? $data['payment_method'] : '';
+		$paymentMethod = $data['payment_method'] ?? '';
 		$rowFields     = EventbookingHelperRegistration::getFormFields($eventId, 0, null, null, $typeOfRegistration);
-		$form          = new RADForm($rowFields);
-		$form->bind($data);
 
-		if ($waitingList == true)
+		// Filter data
+		$data = $this->filterFormData($rowFields, $data);
+
+		$form = new RADForm($rowFields);
+		$form->bind($data);
+		$form->handleFieldsDependOnPaymentMethod($paymentMethod);
+
+		if ($waitingList)
 		{
-			$fees = EventbookingHelper::callOverridableHelperMethod('Registration', 'calculateIndividualRegistrationFees', [$event, $form, $data, $config, ''], 'Helper');
+			$fees = EventbookingHelper::callOverridableHelperMethod(
+				'Registration',
+				'calculateIndividualRegistrationFees',
+				[$event, $form, $data, $config, ''],
+				'Helper'
+			);
 		}
 		else
 		{
-			$fees = EventbookingHelper::callOverridableHelperMethod('Registration', 'calculateIndividualRegistrationFees', [$event, $form, $data, $config, $paymentMethod], 'Helper');
+			$fees = EventbookingHelper::callOverridableHelperMethod(
+				'Registration',
+				'calculateIndividualRegistrationFees',
+				[$event, $form, $data, $config, $paymentMethod],
+				'Helper'
+			);
 		}
 
 		$paymentType = isset($data['payment_type']) ? (int) $data['payment_type'] : 0;
@@ -88,7 +107,7 @@ class EventBookingModelOverrideRegister extends RADModel
 		$data['deposit_amount']         = $fees['deposit_amount'];
 		$data['payment_processing_fee'] = $fees['payment_processing_fee'];
 		$data['coupon_discount_amount'] = round($fees['coupon_discount_amount'], 2);
-
+		$data['tax_rate']               = $fees['tax_rate'];
 		$row->bind($data);
 		$row->id = 0;
 
@@ -102,11 +121,10 @@ class EventBookingModelOverrideRegister extends RADModel
 		}
 
 		$row->agree_privacy_policy = 1;
-
-		$row->group_id           = 0;
-		$row->published          = 0;
-		$row->register_date      = gmdate('Y-m-d H:i:s');
-		$row->number_registrants = 1;
+		$row->group_id             = 0;
+		$row->published            = 0;
+		$row->register_date        = gmdate('Y-m-d H:i:s');
+		$row->number_registrants   = 1;
 
 		if (isset($data['user_id']))
 		{
@@ -114,7 +132,7 @@ class EventBookingModelOverrideRegister extends RADModel
 		}
 		else
 		{
-			$row->user_id = $user->get('id');
+			$row->user_id = $user->id;
 		}
 
 		if ($row->deposit_amount > 0)
@@ -129,24 +147,24 @@ class EventBookingModelOverrideRegister extends RADModel
 		$row->user_ip = EventbookingHelper::getUserIp();
 
 		//Save the active language
-		if (JFactory::getApplication()->getLanguageFilter())
+		if (Factory::getApplication()->getLanguageFilter())
 		{
-			$row->language = JFactory::getLanguage()->getTag();
+			$row->language = Factory::getLanguage()->getTag();
 		}
 		else
 		{
 			$row->language = '*';
 		}
 
-		$couponCode = isset($data['coupon_code']) ? $data['coupon_code'] : null;
+		$couponCode = $data['coupon_code'] ?? null;
 
 		if ($couponCode && $fees['coupon_valid'])
 		{
-			$coupon         = $fees['coupon'];
+			$coupon = $fees['coupon'];
 
 			// NM@02.12.2019: In case the awo-flag is set, try to migrate the coupon record for internal bookkeeping.
-            if($coupon->awo){
-                $coupon = $this->migrateAndRecordAwoCouponUsage( $coupon, $data, $row, $fees );
+            if ($coupon->awo){
+                $coupon = $this->migrateAndRecordAwoCouponUsage($coupon, $data, $row, $fees);
             }
 
 			$row->coupon_id = $coupon->id;
@@ -168,103 +186,34 @@ class EventBookingModelOverrideRegister extends RADModel
 			$row->payment_method = 'os_offline';
 		}
 
+		$params = new Registry($row->params);
+		$params->set('fields_fee_amount', $fees['fields_fee_amount'] ?? []);
+		$row->params = $params->toString();
+
 		$row->store();
+
+		// Store custom fields data
 		$form->storeData($row->id, $data);
 
-		// Store registrant data
+		// Store registrant tickets
 		if ($event->has_multiple_ticket_types)
 		{
-			$ticketTypes = EventbookingHelperData::getTicketTypes($eventId, true);
+			$this->storeRegistrantTickets($row, $event, $data);
+		}
 
-			foreach ($ticketTypes as $ticketType)
-			{
-				if (!empty($data['ticket_type_' . $ticketType->id]))
-				{
-					$quantity = (int) $data['ticket_type_' . $ticketType->id];
-					$query->clear()
-						->insert('#__eb_registrant_tickets')
-						->columns('registrant_id, ticket_type_id, quantity')
-						->values("$row->id, $ticketType->id, $quantity");
-					$db->setQuery($query)
-						->execute();
-				}
-			}
-
-			$params = new Registry($event->params);
-
-			if ($params->get('ticket_types_collect_members_information'))
-			{
-				// Store Members information
-
-				$numberRegistrants = 0;
-				$count             = 0;
-
-				foreach ($ticketTypes as $ticketType)
-				{
-					if (!empty($data['ticket_type_' . $ticketType->id]))
-					{
-						$quantity          = (int) $data['ticket_type_' . $ticketType->id];
-						$numberRegistrants += $quantity;
-
-						$memberFormFields = EventbookingHelperRegistration::getFormFields($eventId, 2);
-
-						for ($i = 0; $i < $quantity; $i++)
-						{
-							$rowMember                       = JTable::getInstance('EventBooking', 'Registrant');
-							$rowMember->group_id             = $row->id;
-							$rowMember->transaction_id       = $row->transaction_id;
-							$rowMember->ticket_qrcode        = EventbookingHelperRegistration::getTicketQRCode();
-							$rowMember->event_id             = $row->event_id;
-							$rowMember->payment_method       = $row->payment_method;
-							$rowMember->payment_status       = $row->payment_status;
-							$rowMember->user_id              = $row->user_id;
-							$rowMember->register_date        = $row->register_date;
-							$rowMember->user_ip              = $row->user_ip;
-							$rowMember->registration_code    = EventbookingHelperRegistration::getRegistrationCode();
-							$rowMember->total_amount         = $ticketType->price;
-							$rowMember->discount_amount      = 0;
-							$rowMember->late_fee             = 0;
-							$rowMember->tax_amount           = 0;
-							$rowMember->amount               = $ticketType->price;
-							$rowMember->number_registrants   = 1;
-							$rowMember->subscribe_newsletter = $row->subscribe_newsletter;
-							$rowMember->agree_privacy_policy = 1;
-
-							$count++;
-
-							$memberForm = new RADForm($memberFormFields);
-							$memberForm->setFieldSuffix($count);
-							$memberForm->bind($data, true);
-							$memberForm->buildFieldsDependency();
-
-							$memberForm->removeFieldSuffix();
-							$memberData = $memberForm->getFormData();
-							$rowMember->bind($memberData);
-							$rowMember->store();
-
-							$memberForm->storeData($rowMember->id, $memberData);
-
-							// Store registrant ticket type information
-							$query->clear()
-								->insert('#__eb_registrant_tickets')
-								->columns('registrant_id, ticket_type_id, quantity')
-								->values("$rowMember->id, $ticketType->id, 1");
-							$db->setQuery($query)
-								->execute();
-						}
-
-						$row->is_group_billing   = 1;
-						$row->number_registrants = $numberRegistrants;
-						$row->store();
-					}
-				}
-			}
+		/* Accept privacy consent to avoid Joomla requires users to accept it again */
+		if (PluginHelper::isEnabled(
+				'system',
+				'privacyconsent'
+			) && $row->user_id > 0 && $config->show_privacy_policy_checkbox)
+		{
+			EventbookingHelperRegistration::acceptPrivacyConsent($row);
 		}
 
 		$data['event_title'] = $event->title;
 
-		JPluginHelper::importPlugin('eventbooking');
-		$app->triggerEvent('onAfterStoreRegistrant', array($row));
+		PluginHelper::importPlugin('eventbooking');
+		$app->triggerEvent('onAfterStoreRegistrant', [$row]);
 
 		if ($row->deposit_amount > 0)
 		{
@@ -272,112 +221,23 @@ class EventBookingModelOverrideRegister extends RADModel
 		}
 
 		// Store registration_code into session, use for registration complete code
-		JFactory::getSession()->set('eb_registration_code', $row->registration_code);
+		Factory::getSession()->set('eb_registration_code', $row->registration_code);
 
 		if ($row->amount > 0 && !$waitingList)
 		{
-			require_once JPATH_COMPONENT . '/payments/' . $paymentMethod . '.php';
-
-			$itemName = JText::_('EB_EVENT_REGISTRATION');
-			$itemName = str_replace('[EVENT_TITLE]', $data['event_title'], $itemName);
-			$itemName = str_replace('[EVENT_DATE]', JHtml::_('date', $event->event_date, $config->date_format, null), $itemName);
-			$itemName = str_replace('[FIRST_NAME]', $row->first_name, $itemName);
-			$itemName = str_replace('[LAST_NAME]', $row->last_name, $itemName);
-			$itemName = str_replace('[REGISTRANT_ID]', $row->id, $itemName);
-
-			$data['item_name'] = $itemName;
-
-			// Guess card type based on card number
-			if (!empty($data['x_card_num']) && empty($data['card_type']))
-			{
-				$data['card_type'] = EventbookingHelperCreditcard::getCardType($data['x_card_num']);
-			}
-
-			$query->clear()
-				->select('title, params')
-				->from('#__eb_payment_plugins')
-				->where('name = ' . $db->quote($paymentMethod));
-			$db->setQuery($query);
-			$plugin       = $db->loadObject();
-			$params       = new Registry($plugin->params);
-			$paymentClass = new $paymentMethod($params);
-			$paymentClass->setTitle(JText::_($plugin->title));
-
-			// Convert payment amount to USD if the currency is not supported by payment gateway
-			$currency = $event->currency_code ? $event->currency_code : $config->currency_code;
-
-			if (method_exists($paymentClass, 'getSupportedCurrencies'))
-			{
-				$currencies = $paymentClass->getSupportedCurrencies();
-
-				if (!in_array($currency, $currencies))
-				{
-					$data['amount'] = EventbookingHelper::callOverridableHelperMethod('Helper', 'convertAmountToUSD', [$data['amount'], $currency]);
-					$currency       = 'USD';
-				}
-			}
-
-			$data['currency'] = $currency;
-
-			$country         = empty($data['country']) ? $config->default_country : $data['country'];
-			$data['country'] = EventbookingHelper::getCountryCode($country);
-
-			// Store payment amount and payment currency for future validation
-			$row->payment_currency = $currency;
-			$row->payment_amount   = $data['amount'];
-			$row->store();
-
-			$paymentClass->processPayment($row, $data);
+			$this->processRegistrationPayment($row, $event, $data);
 		}
 		else
 		{
 			if (!$waitingList)
 			{
-				$row->payment_date = gmdate('Y-m-d H:i:s');
-
-				if ($row->total_amount == 0)
-				{
-					$published = $event->free_event_registration_status;
-				}
-				else
-				{
-					$published = 1;
-				}
-
-				if ($published == 0)
-				{
-					$row->payment_method = 'os_offline';
-				}
-				else
-				{
-					$row->payment_method = '';
-				}
-
-				$row->published = $published;
-
-				$row->store();
-
-				if ($row->published == 1)
-				{
-					// Update ticket members information status
-					if ($row->is_group_billing)
-					{
-						EventbookingHelperRegistration::updateGroupRegistrationRecord($row->id);
-					}
-
-					$app->triggerEvent('onAfterPaymentSuccess', array($row));
-				}
-
-				EventbookingHelper::callOverridableHelperMethod('Mail', 'sendEmails', [$row, $config]);
+				$this->completeNonePaymentRegistration($row, $event);
 
 				return 1;
 			}
-			else
-			{
-				EventbookingHelper::callOverridableHelperMethod('Mail', 'sendWaitinglistEmail', [$row, $config]);
+			EventbookingHelper::callOverridableHelperMethod('Mail', 'sendWaitinglistEmail', [$row, $config]);
 
-				return 2;
-			}
+			return 2;
 		}
     }
 
@@ -394,7 +254,7 @@ class EventBookingModelOverrideRegister extends RADModel
 	 *
 	 * @return array
 	 */
-    private function migrateAndRecordAwoCouponUsage( $awoCoupon, $data, $registrant, $fees ) 
+    private function migrateAndRecordAwoCouponUsage($awoCoupon, $data, $registrant, $fees) 
     {
         if ( ! self::init_awocoupon() )
         {
@@ -449,7 +309,9 @@ class EventBookingModelOverrideRegister extends RADModel
 		if ( ! class_exists( 'awocoupon' ) ) {
 			return false;
 		}
-		AwoCoupon::instance();
+		if ( ! function_exists( 'AC' ) ) {
+			AwoCoupon::instance();
+		}
 		AC()->init();
 		return true;
 	}
@@ -478,6 +340,7 @@ class EventBookingModelOverrideRegister extends RADModel
 		$rows = $db->get_objectlist( $sql );
 
 		$coupon_details = $db->escape( AC()->helper->json_encode( $data ) );
+		$created_at = gmdate( 'Y-m-d H:i:s' );
 
 		foreach ( $rows as $coupon_row ) {
 
@@ -507,7 +370,7 @@ class EventBookingModelOverrideRegister extends RADModel
 						order_id=' . $order_id . ',
 						productids="NULL",
 						details="' . $coupon_details . '",
-						timestamp="' . gmdate( 'Y-m-d H:i:s' ) . '"
+						created_at="' . $created_at . '"
 			';
 			$db->query( $sql );
 
